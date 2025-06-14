@@ -7,38 +7,36 @@ import os
 
 app = Flask(__name__)
 
-# Slack credentials and config
+# Load environment variables
 slack_token = os.environ.get("SLACK_BOT_TOKEN")
 signing_secret = os.environ.get("SLACK_SIGNING_SECRET")
 channel_id = os.environ.get("CHANNEL_ID")
 client = WebClient(token=slack_token)
 
-# In-memory ticket tracking
+# Track tickets in memory
 tickets = {}
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     data = request.get_json()
 
-    # ✅ Handle Slack's challenge verification
+    # ✅ Handle Slack URL verification
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
 
-    # Handle reaction_added events
+    # 📩 Handle emoji reaction events
     if data.get("type") == "event_callback":
         event = data.get("event", {})
         if event.get("type") == "reaction_added":
             ts = event.get("item", {}).get("ts")
-            user_reacted = event.get("user")
             reaction = event.get("reaction")
 
-            print(f"Reaction {reaction} added by {user_reacted} to message {ts}")
+            print(f"Reaction '{reaction}' added to message {ts}")
 
-            # Stop tracking if ✅ emoji is added
             if reaction == "white_check_mark":
                 for ticket_id, info in list(tickets.items()):
-                    if info['ts'] == ts:
-                        print(f"✅ Ticket {ticket_id} marked complete.")
+                    if info["ts"] == ts:
+                        print(f"✅ Ticket {ticket_id} resolved. Stopping reminders.")
                         del tickets[ticket_id]
 
     return "", 200
@@ -46,9 +44,12 @@ def slack_events():
 @app.route("/new_ticket", methods=["POST"])
 def new_ticket():
     data = request.json
-    ticket_id = data['ticket_id']
-    assignee_slack_id = data['assignee_slack_id']
-    message_ts = data['message_ts']
+    ticket_id = data.get("ticket_id")
+    assignee_slack_id = data.get("assignee_slack_id")
+    message_ts = data.get("message_ts")
+
+    if not (ticket_id and assignee_slack_id and message_ts):
+        return {"error": "Missing ticket_id, assignee_slack_id, or message_ts"}, 400
 
     tickets[ticket_id] = {
         "ts": message_ts,
@@ -59,15 +60,13 @@ def new_ticket():
     print(f"[+] Tracking ticket {ticket_id} for <@{assignee_slack_id}>")
     return {"status": "ok"}, 200
 
-def check_reactions():
+def check_reminders():
     for ticket_id, info in list(tickets.items()):
         try:
             res = client.reactions_get(channel=channel_id, timestamp=info['ts'])
             reactions = res['message'].get('reactions', [])
-            has_check = any(r['name'] == 'white_check_mark' for r in reactions)
-
-            if has_check:
-                print(f"✅ Ticket {ticket_id} resolved.")
+            if any(r['name'] == 'white_check_mark' for r in reactions):
+                print(f"✅ Ticket {ticket_id} manually resolved by emoji.")
                 del tickets[ticket_id]
             else:
                 now = datetime.now()
@@ -79,12 +78,13 @@ def check_reactions():
                     tickets[ticket_id]['last_reminder'] = now
 
         except SlackApiError as e:
-            print(f"Slack error: {e.response['error']}")
+            print(f"[!] Slack API error on ticket {ticket_id}: {e.response['error']}")
 
-# Scheduler to run every 10 minutes
+# Start scheduler
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=check_reactions, trigger="interval", minutes=10)
+scheduler.add_job(func=check_reminders, trigger="interval", minutes=10)
 scheduler.start()
 
+# Start Flask app
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
