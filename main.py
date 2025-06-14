@@ -71,3 +71,20 @@ def check_reminders():
             else:
                 now = datetime.now()
                 if now - info['last_reminder'] >= timedelta(hours=4):
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"<@{info['assignee_slack_id']}> Reminder: please follow up on ticket {ticket_id}"
+                    )
+                    tickets[ticket_id]['last_reminder'] = now
+
+        except SlackApiError as e:
+            print(f"[!] Slack API error on ticket {ticket_id}: {e.response['error']}")
+
+# ⏰ Start reminder scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=check_reminders, trigger="interval", minutes=10)
+scheduler.start()
+
+# 🔥 Start the Flask app
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
