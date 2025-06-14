@@ -87,4 +87,31 @@ def check_reminders():
     for ticket_id, info in list(tickets.items()):
         try:
             res = client.reactions_get(channel=channel_id, timestamp=info['ts'])
-            reactions = res['message'].get(
+            reactions = res['message'].get('reactions', [])
+            if any(r['name'] == 'white_check_mark' for r in reactions):
+                print(f"✅ Ticket {ticket_id} marked complete. Removing from reminders.")
+                del tickets[ticket_id]
+            else:
+                now = datetime.now()
+                if now - info['last_reminder'] >= timedelta(hours=4):
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"<@{info['assignee_slack_id']}> Reminder: please follow up on ticket {ticket_id}"
+                    )
+                    tickets[ticket_id]['last_reminder'] = now
+                    print(f"🔁 Reminder sent for ticket {ticket_id}")
+
+        except SlackApiError as e:
+            print(f"[!] Slack API error for ticket {ticket_id}: {e.response['error']}")
+
+# Scheduler setup
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=check_reminders, trigger="interval", minutes=10)
+scheduler.start()
+
+@app.route("/", methods=["GET"])
+def home():
+    return "Slack Reminder Bot is running ✅", 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
