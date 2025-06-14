@@ -68,32 +68,4 @@ def new_ticket():
         slack_id = ASSIGNEE_MAP.get(assignee_email.lower())
         if not slack_id:
             print(f"[!] No Slack ID found for: {assignee_email}")
-            return jsonify({"error": "Unknown assignee"}), 400
-
-        tickets[ticket_id] = {
-            "ts": message_ts,
-            "assignee_slack_id": slack_id,
-            "last_reminder": datetime.now()
-        }
-
-        print(f"[+] Reminder scheduled for ticket {ticket_id} to <@{slack_id}>")
-        return jsonify({"status": "ok"}), 200
-
-    except Exception as e:
-        print(f"[!!] Exception in /new_ticket: {e}")
-        return jsonify({"error": "server error"}), 500
-
-def check_reminders():
-    for ticket_id, info in list(tickets.items()):
-        try:
-            res = client.reactions_get(channel=channel_id, timestamp=info['ts'])
-            reactions = res['message'].get('reactions', [])
-            if any(r['name'] == 'white_check_mark' for r in reactions):
-                print(f"✅ Ticket {ticket_id} marked complete. Removing from reminders.")
-                del tickets[ticket_id]
-            else:
-                now = datetime.now()
-                if now - info['last_reminder'] >= timedelta(hours=4):
-                    client.chat_postMessage(
-                        channel=channel_id,
-                        text=f"<@{info['assignee_slack_id']}> Reminder: please follow up on ticket {ticket_id}"
+            return jso
