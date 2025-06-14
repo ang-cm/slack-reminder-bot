@@ -61,14 +61,26 @@ def new_ticket():
         assignee_email = data.get("assignee_email")
         message_ts = data.get("message_ts")
 
+        print(f"🧾 ticket_id: {ticket_id}")
+        print(f"👤 assignee_email: {assignee_email}")
+        print(f"⏱ message_ts: {message_ts}")
+
         if not all([ticket_id, assignee_email, message_ts]):
             print("[!] Missing required fields")
-            return jsonify({"error": "Missing required fields"}), 400
+            missing = []
+            if not ticket_id:
+                missing.append("ticket_id")
+            if not assignee_email:
+                missing.append("assignee_email")
+            if not message_ts:
+                missing.append("message_ts")
+            print(f"[!] Missing: {', '.join(missing)}")
+            return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
 
         slack_id = ASSIGNEE_MAP.get(assignee_email.lower())
         if not slack_id:
             print(f"[!] No Slack ID found for: {assignee_email}")
-            return jsonify({"error": "Unknown assignee"}), 400
+            return jsonify({"error": f"Unknown assignee: {assignee_email}"}), 400
 
         tickets[ticket_id] = {
             "ts": message_ts,
