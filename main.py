@@ -13,18 +13,18 @@ signing_secret = os.environ.get("SLACK_SIGNING_SECRET")
 channel_id = os.environ.get("CHANNEL_ID")
 client = WebClient(token=slack_token)
 
-# Track tickets in memory
+# Track ticket reminders
 tickets = {}
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     data = request.get_json()
 
-    # ✅ Handle Slack URL verification
+    # ✅ Handle Slack URL verification challenge
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
 
-    # 📩 Handle emoji reaction events
+    # 🎯 Handle reactions
     if data.get("type") == "event_callback":
         event = data.get("event", {})
         if event.get("type") == "reaction_added":
@@ -49,7 +49,7 @@ def new_ticket():
     message_ts = data.get("message_ts")
 
     if not (ticket_id and assignee_slack_id and message_ts):
-        return {"error": "Missing ticket_id, assignee_slack_id, or message_ts"}, 400
+        return {"error": "Missing required fields"}, 400
 
     tickets[ticket_id] = {
         "ts": message_ts,
@@ -66,25 +66,8 @@ def check_reminders():
             res = client.reactions_get(channel=channel_id, timestamp=info['ts'])
             reactions = res['message'].get('reactions', [])
             if any(r['name'] == 'white_check_mark' for r in reactions):
-                print(f"✅ Ticket {ticket_id} manually resolved by emoji.")
+                print(f"✅ Ticket {ticket_id} marked complete by emoji.")
                 del tickets[ticket_id]
             else:
                 now = datetime.now()
                 if now - info['last_reminder'] >= timedelta(hours=4):
-                    client.chat_postMessage(
-                        channel=channel_id,
-                        text=f"<@{info['assignee_slack_id']}> Reminder: please follow up on ticket {ticket_id}"
-                    )
-                    tickets[ticket_id]['last_reminder'] = now
-
-        except SlackApiError as e:
-            print(f"[!] Slack API error on ticket {ticket_id}: {e.response['error']}")
-
-# Start scheduler
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=check_reminders, trigger="interval", minutes=10)
-scheduler.start()
-
-# Start Flask app
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
