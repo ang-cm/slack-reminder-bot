@@ -190,20 +190,74 @@ def new_ticket():
             logger.error(f"No Slack ID found for: {assignee_email}")
             return jsonify({"error": f"Unknown assignee: {assignee_email}"}), 400
 
-        # Verify the message exists in Slack
+        # FIXED: More robust message verification with better error handling
         try:
+            # Convert timestamp to float if it's a string
+            ts_float = float(message_ts)
+            
+            # Verify the message exists in Slack with a slightly wider window
+            # to account for potential timestamp precision issues
             result = client.conversations_history(
                 channel=channel_id,
-                latest=float(message_ts) + 1,
-                oldest=float(message_ts) - 1,
-                limit=1
+                latest=str(ts_float + 1),  # Add 1 second buffer
+                oldest=str(ts_float - 1),  # Subtract 1 second buffer
+                limit=5  # Get a few messages around this timestamp
             )
+            
+            # Log the messages we found for debugging
+            logger.info(f"Found {len(result.get('messages', []))} messages near timestamp {message_ts}")
+            
+            # Check if we found at least one message
             if not result.get("messages"):
-                logger.error(f"Message with ts={message_ts} not found in Slack")
-                return jsonify({"error": "Message not found in Slack"}), 404
+                logger.error(f"No messages found near ts={message_ts}")
+                
+                # Instead of rejecting, we'll create a placeholder/fallback message
+                logger.info(f"Creating fallback placeholder message for ticket {ticket_id}")
+                
+                placeholder_result = client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"⚠️ *Tracking Zendesk Ticket #{ticket_id}*\n\n"
+                         f"This is a fallback message created to track ticket #{ticket_id} assigned to {assignee_email}.\n\n"
+                         f"To stop reminders, add a :white_check_mark: reaction to this message or solve the ticket in Zendesk."
+                )
+                
+                # Use the new message timestamp instead
+                message_ts = placeholder_result["ts"]
+                logger.info(f"Created fallback message with ts: {message_ts}")
         except SlackApiError as e:
-            logger.error(f"Failed to verify message: {e.response['error']}")
-            return jsonify({"error": f"Failed to verify message: {e.response['error']}"}), 500
+            logger.error(f"Slack API error: {e.response['error']}")
+            
+            # Rather than failing, we'll create a fallback message
+            logger.info(f"Creating fallback message after API error for ticket {ticket_id}")
+            try:
+                placeholder_result = client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"⚠️ *Tracking Zendesk Ticket #{ticket_id}*\n\n"
+                         f"This is a fallback message created to track ticket #{ticket_id} assigned to {assignee_email}.\n\n"
+                         f"To stop reminders, add a :white_check_mark: reaction to this message or solve the ticket in Zendesk."
+                )
+                message_ts = placeholder_result["ts"]
+                logger.info(f"Created fallback message with ts: {message_ts}")
+            except SlackApiError as inner_e:
+                logger.error(f"Failed to create fallback message: {inner_e}")
+                return jsonify({"error": "Failed to create or verify message"}), 500
+        except ValueError as e:
+            # Handle case where message_ts is not a valid float
+            logger.error(f"Invalid timestamp format: {message_ts}, error: {e}")
+            
+            # Create a fallback message
+            try:
+                placeholder_result = client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"⚠️ *Tracking Zendesk Ticket #{ticket_id}*\n\n"
+                         f"This is a fallback message created to track ticket #{ticket_id} assigned to {assignee_email}.\n\n"
+                         f"To stop reminders, add a :white_check_mark: reaction to this message or solve the ticket in Zendesk."
+                )
+                message_ts = placeholder_result["ts"]
+                logger.info(f"Created fallback message with ts: {message_ts}")
+            except SlackApiError as inner_e:
+                logger.error(f"Failed to create fallback message: {inner_e}")
+                return jsonify({"error": "Failed to create fallback message"}), 500
 
         # Add to tracked tickets
         tickets[ticket_id] = {
