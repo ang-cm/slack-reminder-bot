@@ -50,6 +50,10 @@ signing_secret = os.environ.get("SLACK_SIGNING_SECRET")
 channel_id = os.environ.get("CHANNEL_ID")
 webhook_secret_token = os.environ.get("WEBHOOK_SECRET_TOKEN")
 
+# Log important environment variables (except sensitive ones)
+logger.info(f"Slack channel ID: '{channel_id}'")
+logger.info(f"Bot token configured: {bool(slack_token)}")
+
 client = WebClient(token=slack_token)
 
 # Zendesk email → Slack user ID map
@@ -185,6 +189,11 @@ def new_ticket():
             logger.error(f"Missing required fields: {', '.join(missing)}")
             return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
 
+        # Check channel ID
+        if not channel_id:
+            logger.error("CHANNEL_ID environment variable not set!")
+            return jsonify({"error": "CHANNEL_ID not configured"}), 500
+
         slack_id = ASSIGNEE_MAP.get(assignee_email.lower())
         if not slack_id:
             logger.error(f"No Slack ID found for: {assignee_email}")
@@ -209,13 +218,14 @@ def new_ticket():
             
             # Check if we found at least one message
             if not result.get("messages"):
-                logger.error(f"No messages found near ts={message_ts}")
+                logger.warning(f"No messages found near ts={message_ts}")
                 
                 # Instead of rejecting, we'll create a placeholder/fallback message
                 logger.info(f"Creating fallback placeholder message for ticket {ticket_id}")
                 
+                # FIXED: Explicitly pass the channel_id
                 placeholder_result = client.chat_postMessage(
-                    channel=channel_id,
+                    channel=channel_id,  # Make sure channel is explicitly set
                     text=f"⚠️ *Tracking Zendesk Ticket #{ticket_id}*\n\n"
                          f"This is a fallback message created to track ticket #{ticket_id} assigned to {assignee_email}.\n\n"
                          f"To stop reminders, add a :white_check_mark: reaction to this message or solve the ticket in Zendesk."
@@ -225,13 +235,19 @@ def new_ticket():
                 message_ts = placeholder_result["ts"]
                 logger.info(f"Created fallback message with ts: {message_ts}")
         except SlackApiError as e:
-            logger.error(f"Slack API error: {e.response['error']}")
+            logger.error(f"Slack API error: {e.response.get('error', str(e))}")
             
             # Rather than failing, we'll create a fallback message
             logger.info(f"Creating fallback message after API error for ticket {ticket_id}")
             try:
+                # FIXED: Explicitly check and pass channel_id
+                if not channel_id:
+                    logger.error("Cannot create fallback message: CHANNEL_ID not set")
+                    return jsonify({"error": "Channel ID not configured"}), 500
+                    
+                # FIXED: Explicitly pass the channel_id
                 placeholder_result = client.chat_postMessage(
-                    channel=channel_id,
+                    channel=channel_id,  # Ensure this is correct and not empty
                     text=f"⚠️ *Tracking Zendesk Ticket #{ticket_id}*\n\n"
                          f"This is a fallback message created to track ticket #{ticket_id} assigned to {assignee_email}.\n\n"
                          f"To stop reminders, add a :white_check_mark: reaction to this message or solve the ticket in Zendesk."
@@ -240,15 +256,22 @@ def new_ticket():
                 logger.info(f"Created fallback message with ts: {message_ts}")
             except SlackApiError as inner_e:
                 logger.error(f"Failed to create fallback message: {inner_e}")
-                return jsonify({"error": "Failed to create or verify message"}), 500
+                # Provide better error details
+                error_details = inner_e.response.get('error', str(inner_e))
+                metadata = inner_e.response.get('response_metadata', {})
+                if metadata and 'messages' in metadata:
+                    error_details += f" - {', '.join(metadata['messages'])}"
+                logger.error(f"Error details: {error_details}")
+                return jsonify({"error": f"Failed to create or verify message: {error_details}"}), 500
         except ValueError as e:
             # Handle case where message_ts is not a valid float
             logger.error(f"Invalid timestamp format: {message_ts}, error: {e}")
             
             # Create a fallback message
             try:
+                # FIXED: Explicitly pass the channel_id
                 placeholder_result = client.chat_postMessage(
-                    channel=channel_id,
+                    channel=channel_id,  # Ensure this is correct
                     text=f"⚠️ *Tracking Zendesk Ticket #{ticket_id}*\n\n"
                          f"This is a fallback message created to track ticket #{ticket_id} assigned to {assignee_email}.\n\n"
                          f"To stop reminders, add a :white_check_mark: reaction to this message or solve the ticket in Zendesk."
@@ -257,7 +280,8 @@ def new_ticket():
                 logger.info(f"Created fallback message with ts: {message_ts}")
             except SlackApiError as inner_e:
                 logger.error(f"Failed to create fallback message: {inner_e}")
-                return jsonify({"error": "Failed to create fallback message"}), 500
+                error_details = inner_e.response.get('error', str(inner_e))
+                return jsonify({"error": f"Failed to create fallback message: {error_details}"}), 500
 
         # Add to tracked tickets
         tickets[ticket_id] = {
@@ -278,7 +302,7 @@ def new_ticket():
 
     except Exception as e:
         logger.error(f"Exception in /new_ticket: {e}", exc_info=True)
-        return jsonify({"error": "server error"}), 500
+        return jsonify({"error": f"server error: {str(e)}"}), 500
 
 @app.route("/complete_ticket", methods=["POST"])
 @require_token
@@ -316,7 +340,12 @@ def health_check():
         "status": "healthy",
         "time": datetime.now().isoformat(),
         "active_tickets": len(tickets),
-        "scheduler_running": scheduler.running
+        "scheduler_running": scheduler.running,
+        "environment": {
+            "channel_id_configured": bool(channel_id),
+            "slack_token_configured": bool(slack_token),
+            "webhook_token_configured": bool(webhook_secret_token)
+        }
     }
     
     # Test Slack API connection
@@ -382,9 +411,26 @@ scheduler.start()
 if __name__ == "__main__":
     # Check connections on startup
     try:
+        # Validate critical configuration
+        if not channel_id:
+            logger.critical("CHANNEL_ID environment variable is not set! The bot will not function correctly.")
+        else:
+            logger.info(f"Using Slack channel: {channel_id}")
+            
+        if not slack_token:
+            logger.critical("SLACK_BOT_TOKEN environment variable is not set! The bot will not function correctly.")
+        
         # Test Slack connection
         auth_test = client.auth_test()
         logger.info(f"Connected to Slack as {auth_test['user']} in team {auth_test['team']}")
+        
+        # Verify channel access
+        if channel_id:
+            try:
+                channel_info = client.conversations_info(channel=channel_id)
+                logger.info(f"Connected to Slack channel: {channel_info['channel'].get('name', channel_id)}")
+            except SlackApiError as e:
+                logger.critical(f"Cannot access the specified channel {channel_id}: {e.response['error']}")
     except SlackApiError as e:
         logger.error(f"Failed to connect to Slack: {e}")
     
