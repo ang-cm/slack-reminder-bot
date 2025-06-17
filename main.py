@@ -47,12 +47,19 @@ logger = setup_logging()
 # Load environment variables
 slack_token = os.environ.get("SLACK_BOT_TOKEN")
 signing_secret = os.environ.get("SLACK_SIGNING_SECRET")
-channel_id = os.environ.get("CHANNEL_ID")
 webhook_secret_token = os.environ.get("WEBHOOK_SECRET_TOKEN")
 
-# Log important environment variables (except sensitive ones)
-logger.info(f"Slack channel ID: '{channel_id}'")
-logger.info(f"Bot token configured: {bool(slack_token)}")
+# Updated channel configuration to support both SOS and escalations channels
+SLACK_CHANNELS = {
+    "sos": os.environ.get("CHANNEL_ID"),  # Your existing SOS channel
+    "escalations": os.environ.get("SLACK_CHANNEL_ID_ESCALATIONS")  # New escalations channel
+}
+
+# Validate channel configuration
+if not SLACK_CHANNELS.get("sos"):
+    logger.error("CHANNEL_ID environment variable not set!")
+if not SLACK_CHANNELS.get("escalations"):
+    logger.warning("SLACK_CHANNEL_ID_ESCALATIONS environment variable not set, escalation tickets will go to the SOS channel")
 
 client = WebClient(token=slack_token)
 
@@ -150,13 +157,14 @@ def slack_events():
         event = data.get("event", {})
         if event.get("type") == "reaction_added":
             ts = event.get("item", {}).get("ts")
+            channel = event.get("item", {}).get("channel")
             reaction = event.get("reaction")
-            logger.info(f"Reaction '{reaction}' added to message {ts}")
+            logger.info(f"Reaction '{reaction}' added to message {ts} in channel {channel}")
 
             if reaction == "white_check_mark":
                 for ticket_id, info in list(tickets.items()):
-                    if info["ts"] == ts:
-                        logger.info(f"✅ Ticket {ticket_id} resolved via emoji. Stopping reminders.")
+                    if info["ts"] == ts and info.get("channel_id", SLACK_CHANNELS.get("sos")) == channel:
+                        logger.info(f"✅ Ticket {ticket_id} resolved via emoji in channel {channel}. Stopping reminders.")
                         del tickets[ticket_id]
                         save_tickets()
 
@@ -173,10 +181,28 @@ def new_ticket():
         assignee_email = data.get("assignee_email")
         message_ts = data.get("message_ts")
         ticket_url = data.get("ticket_url")
+        
+        # Get channel information from payload
+        channel_id = data.get("channel_id")
+        channel_type = data.get("channel_type", "sos")
+        is_escalation = data.get("is_escalation", False)
+        
+        # If no channel ID was provided, determine which one to use
+        if not channel_id:
+            # Choose based on ticket type
+            channel_id = SLACK_CHANNELS.get(
+                "escalations" if is_escalation or channel_type == "escalations" else "sos", 
+                SLACK_CHANNELS.get("sos")
+            )
+            
+            if not channel_id:
+                logger.error("No channel ID provided or configured")
+                return jsonify({"error": "No channel ID available"}), 400
 
         logger.info(f"🧾 ticket_id: {ticket_id}")
         logger.info(f"👤 assignee_email: {assignee_email}")
         logger.info(f"⏱ message_ts: {message_ts}")
+        logger.info(f"📢 channel_id: {channel_id} (type: {channel_type})")
 
         if not all([ticket_id, assignee_email, message_ts]):
             missing = []
@@ -191,8 +217,8 @@ def new_ticket():
 
         # Check channel ID
         if not channel_id:
-            logger.error("CHANNEL_ID environment variable not set!")
-            return jsonify({"error": "CHANNEL_ID not configured"}), 500
+            logger.error("No channel ID provided and default channel not configured!")
+            return jsonify({"error": "No channel ID available"}), 500
 
         slack_id = ASSIGNEE_MAP.get(assignee_email.lower())
         if not slack_id:
@@ -218,15 +244,18 @@ def new_ticket():
             
             # Check if we found at least one message
             if not result.get("messages"):
-                logger.warning(f"No messages found near ts={message_ts}")
+                logger.warning(f"No messages found near ts={message_ts} in channel {channel_id}")
                 
                 # Instead of rejecting, we'll create a placeholder/fallback message
                 logger.info(f"Creating fallback placeholder message for ticket {ticket_id}")
                 
+                # Add escalation indicator if needed
+                escalation_tag = "🔴 **ESCALATION** " if channel_type == "escalations" or is_escalation else ""
+                
                 # FIXED: Explicitly pass the channel_id
                 placeholder_result = client.chat_postMessage(
                     channel=channel_id,  # Make sure channel is explicitly set
-                    text=f"⚠️ *Tracking Zendesk Ticket #{ticket_id}*\n\n"
+                    text=f"⚠️ {escalation_tag}*Tracking Zendesk Ticket #{ticket_id}*\n\n"
                          f"This is a fallback message created to track ticket #{ticket_id} assigned to {assignee_email}.\n\n"
                          f"To stop reminders, add a :white_check_mark: reaction to this message or solve the ticket in Zendesk."
                 )
@@ -242,13 +271,16 @@ def new_ticket():
             try:
                 # FIXED: Explicitly check and pass channel_id
                 if not channel_id:
-                    logger.error("Cannot create fallback message: CHANNEL_ID not set")
+                    logger.error("Cannot create fallback message: channel_id not set")
                     return jsonify({"error": "Channel ID not configured"}), 500
                     
+                # Add escalation indicator if needed
+                escalation_tag = "🔴 **ESCALATION** " if channel_type == "escalations" or is_escalation else ""
+                
                 # FIXED: Explicitly pass the channel_id
                 placeholder_result = client.chat_postMessage(
                     channel=channel_id,  # Ensure this is correct and not empty
-                    text=f"⚠️ *Tracking Zendesk Ticket #{ticket_id}*\n\n"
+                    text=f"⚠️ {escalation_tag}*Tracking Zendesk Ticket #{ticket_id}*\n\n"
                          f"This is a fallback message created to track ticket #{ticket_id} assigned to {assignee_email}.\n\n"
                          f"To stop reminders, add a :white_check_mark: reaction to this message or solve the ticket in Zendesk."
                 )
@@ -269,10 +301,13 @@ def new_ticket():
             
             # Create a fallback message
             try:
+                # Add escalation indicator if needed
+                escalation_tag = "🔴 **ESCALATION** " if channel_type == "escalations" or is_escalation else ""
+                
                 # FIXED: Explicitly pass the channel_id
                 placeholder_result = client.chat_postMessage(
                     channel=channel_id,  # Ensure this is correct
-                    text=f"⚠️ *Tracking Zendesk Ticket #{ticket_id}*\n\n"
+                    text=f"⚠️ {escalation_tag}*Tracking Zendesk Ticket #{ticket_id}*\n\n"
                          f"This is a fallback message created to track ticket #{ticket_id} assigned to {assignee_email}.\n\n"
                          f"To stop reminders, add a :white_check_mark: reaction to this message or solve the ticket in Zendesk."
                 )
@@ -292,13 +327,20 @@ def new_ticket():
             "created_at": datetime.now(),
             "reminder_count": 0,
             "ticket_url": ticket_url or f"https://finally.zendesk.com/agent/tickets/{ticket_id}",
-            "status": "open"
+            "status": "open",
+            "channel_id": channel_id,               # Store channel_id
+            "channel_type": channel_type,           # Store channel_type
+            "is_escalation": is_escalation          # Store escalation status
         }
         
         save_tickets()
 
-        logger.info(f"[+] Reminder scheduled for ticket {ticket_id} to <@{slack_id}>")
-        return jsonify({"status": "ok"}), 200
+        logger.info(f"[+] Reminder scheduled for ticket {ticket_id} to <@{slack_id}> in channel {channel_id}")
+        return jsonify({
+            "status": "ok",
+            "channel_id": channel_id,
+            "channel_type": channel_type
+        }), 200
 
     except Exception as e:
         logger.error(f"Exception in /new_ticket: {e}", exc_info=True)
@@ -342,7 +384,8 @@ def health_check():
         "active_tickets": len(tickets),
         "scheduler_running": scheduler.running,
         "environment": {
-            "channel_id_configured": bool(channel_id),
+            "sos_channel_configured": bool(SLACK_CHANNELS.get("sos")),
+            "escalations_channel_configured": bool(SLACK_CHANNELS.get("escalations")),
             "slack_token_configured": bool(slack_token),
             "webhook_token_configured": bool(webhook_secret_token)
         }
@@ -365,11 +408,54 @@ def health_check():
 def home():
     return "Slack Reminder Bot is running ✅", 200
 
+@app.route("/tickets", methods=["GET"])
+def list_tickets():
+    """Admin endpoint to list all tracked tickets"""
+    try:
+        # Check for an API key for minimal security
+        api_key = request.args.get("api_key")
+        expected_key = os.environ.get("ADMIN_API_KEY")
+        
+        if not expected_key or api_key != expected_key:
+            return jsonify({"error": "Unauthorized"}), 401
+            
+        # Get ticket summary
+        ticket_summary = []
+        for ticket_id, info in tickets.items():
+            # Create a simplified view
+            ticket_summary.append({
+                "ticket_id": ticket_id,
+                "assignee": info.get("assignee_email"),
+                "channel_type": info.get("channel_type", "sos"),
+                "is_escalation": info.get("is_escalation", False),
+                "reminder_count": info.get("reminder_count", 0),
+                "last_reminder": info.get("last_reminder").isoformat(),
+                "created_at": info.get("created_at").isoformat()
+            })
+            
+        return jsonify({
+            "total_tickets": len(tickets),
+            "tickets": ticket_summary
+        })
+        
+    except Exception as e:
+        logger.error(f"Error listing tickets: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
 def check_reminders():
     """Check for tickets that need reminders"""
     logger.info(f"Checking reminders for {len(tickets)} active tickets")
     for ticket_id, info in list(tickets.items()):
         try:
+            # Get channel ID from ticket info
+            channel_id = info.get('channel_id')
+            if not channel_id:
+                logger.error(f"Missing channel_id for ticket {ticket_id}, using default")
+                channel_id = SLACK_CHANNELS.get("sos")
+                if not channel_id:
+                    logger.error(f"No default channel configured, skipping reminder for ticket {ticket_id}")
+                    continue
+            
             # Check if the ticket has been marked complete with a reaction
             res = client.reactions_get(channel=channel_id, timestamp=info['ts'])
             reactions = res['message'].get('reactions', [])
@@ -379,24 +465,30 @@ def check_reminders():
                 save_tickets()
             else:
                 now = datetime.now()
-                if now - info['last_reminder'] >= timedelta(hours=4):
+                # Determine reminder frequency based on ticket type
+                reminder_hours = 2 if info.get("is_escalation", False) else 4
+                
+                if now - info['last_reminder'] >= timedelta(hours=reminder_hours):
+                    # Add escalation indicator if needed
+                    escalation_tag = "🔴 **ESCALATION** " if info.get("is_escalation", False) else ""
+                    
                     # Send reminder
                     client.chat_postMessage(
                         channel=channel_id,
-                        text=f"<@{info['assignee_slack_id']}> Reminder: please follow up on ticket {ticket_id}"
+                        text=f"{escalation_tag}<@{info['assignee_slack_id']}> Reminder: please follow up on ticket {ticket_id}"
                     )
                     
                     tickets[ticket_id]['last_reminder'] = now
                     tickets[ticket_id]['reminder_count'] = info.get('reminder_count', 0) + 1
                     save_tickets()
                     
-                    logger.info(f"🔁 Reminder sent for ticket {ticket_id} (#{tickets[ticket_id]['reminder_count']})")
+                    logger.info(f"🔁 Reminder sent for ticket {ticket_id} (#{tickets[ticket_id]['reminder_count']}) in channel {channel_id}")
                     
                     # Escalate after 3 reminders
                     if tickets[ticket_id]['reminder_count'] >= 3:
                         client.chat_postMessage(
                             channel=channel_id,
-                            text=f"<!here> Ticket {ticket_id} has been waiting for response for over 12 hours"
+                            text=f"<!here> {escalation_tag}Ticket {ticket_id} has been waiting for response for over {reminder_hours * 3} hours"
                         )
                         logger.info(f"⚠️ Escalated ticket {ticket_id} after {tickets[ticket_id]['reminder_count']} reminders")
 
@@ -412,10 +504,15 @@ if __name__ == "__main__":
     # Check connections on startup
     try:
         # Validate critical configuration
-        if not channel_id:
+        if not SLACK_CHANNELS.get("sos"):
             logger.critical("CHANNEL_ID environment variable is not set! The bot will not function correctly.")
         else:
-            logger.info(f"Using Slack channel: {channel_id}")
+            logger.info(f"Using SOS Slack channel: {SLACK_CHANNELS.get('sos')}")
+            
+        if SLACK_CHANNELS.get("escalations"):
+            logger.info(f"Using escalations Slack channel: {SLACK_CHANNELS.get('escalations')}")
+        else:
+            logger.warning("SLACK_CHANNEL_ID_ESCALATIONS not set, will use SOS channel for escalation tickets")
             
         if not slack_token:
             logger.critical("SLACK_BOT_TOKEN environment variable is not set! The bot will not function correctly.")
@@ -425,12 +522,13 @@ if __name__ == "__main__":
         logger.info(f"Connected to Slack as {auth_test['user']} in team {auth_test['team']}")
         
         # Verify channel access
-        if channel_id:
-            try:
-                channel_info = client.conversations_info(channel=channel_id)
-                logger.info(f"Connected to Slack channel: {channel_info['channel'].get('name', channel_id)}")
-            except SlackApiError as e:
-                logger.critical(f"Cannot access the specified channel {channel_id}: {e.response['error']}")
+        for channel_type, channel_id in SLACK_CHANNELS.items():
+            if channel_id:
+                try:
+                    channel_info = client.conversations_info(channel=channel_id)
+                    logger.info(f"Connected to Slack {channel_type} channel: {channel_info['channel'].get('name', channel_id)}")
+                except SlackApiError as e:
+                    logger.critical(f"Cannot access the {channel_type} channel {channel_id}: {e.response['error']}")
     except SlackApiError as e:
         logger.error(f"Failed to connect to Slack: {e}")
     
